@@ -27,10 +27,11 @@ import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.transport.TransportAddress;
 import org.elasticsearch.env.Environment;
 import org.elasticsearch.node.Node;
-import org.elasticsearch.node.internal.InternalSettingsPreparer;
+import org.elasticsearch.node.NodeValidationException;
 import org.elasticsearch.test.ESIntegTestCase;
 import org.elasticsearch.test.ESIntegTestCase.ClusterScope;
 import org.elasticsearch.test.ESIntegTestCase.Scope;
+import org.elasticsearch.transport.MockTransportClient;
 import org.elasticsearch.transport.TransportService;
 
 import java.io.IOException;
@@ -42,6 +43,7 @@ import static org.hamcrest.Matchers.startsWith;
 
 @ClusterScope(scope = Scope.TEST, numDataNodes = 0, transportClientRatio = 1.0)
 public class TransportClientIT extends ESIntegTestCase {
+
     public void testPickingUpChangesInDiscoveryNode() {
         String nodeName = internalCluster().startNode(Settings.builder().put(Node.NODE_DATA_SETTING.getKey(), false));
 
@@ -50,7 +52,7 @@ public class TransportClientIT extends ESIntegTestCase {
 
     }
 
-    public void testNodeVersionIsUpdated() throws IOException {
+    public void testNodeVersionIsUpdated() throws IOException, NodeValidationException {
         TransportClient client = (TransportClient)  internalCluster().client();
         try (Node node = new Node(Settings.builder()
                 .put(internalCluster().getDefaultSettings())
@@ -91,9 +93,8 @@ public class TransportClientIT extends ESIntegTestCase {
     public void testThatTransportClientSettingCannotBeChanged() {
         Settings baseSettings = Settings.builder()
             .put(Environment.PATH_HOME_SETTING.getKey(), createTempDir())
-            .put("transport.type", "local")
             .build();
-        try (TransportClient client = TransportClient.builder().settings(baseSettings).build()) {
+        try (TransportClient client = new MockTransportClient(baseSettings)) {
             Settings settings = client.injector.getInstance(Settings.class);
             assertThat(Client.CLIENT_TYPE_SETTING_S.get(settings), is("transport"));
         }

@@ -19,6 +19,9 @@
 
 package org.elasticsearch.cluster.service;
 
+import org.apache.logging.log4j.Logger;
+import org.apache.logging.log4j.message.ParameterizedMessage;
+import org.apache.logging.log4j.util.Supplier;
 import org.elasticsearch.cluster.AckedClusterStateTaskListener;
 import org.elasticsearch.cluster.ClusterChangedEvent;
 import org.elasticsearch.cluster.ClusterName;
@@ -43,7 +46,6 @@ import org.elasticsearch.cluster.routing.RoutingTable;
 import org.elasticsearch.common.Nullable;
 import org.elasticsearch.common.Priority;
 import org.elasticsearch.common.component.AbstractLifecycleComponent;
-import org.elasticsearch.common.logging.ESLogger;
 import org.elasticsearch.common.logging.Loggers;
 import org.elasticsearch.common.settings.ClusterSettings;
 import org.elasticsearch.common.settings.Setting;
@@ -156,7 +158,7 @@ public class ClusterService extends AbstractLifecycleComponent {
 
     public synchronized void setLocalNode(DiscoveryNode localNode) {
         assert clusterState.nodes().getLocalNodeId() == null : "local node is already set";
-        DiscoveryNodes.Builder nodeBuilder = DiscoveryNodes.builder(clusterState.nodes()).put(localNode).localNodeId(localNode.getId());
+        DiscoveryNodes.Builder nodeBuilder = DiscoveryNodes.builder(clusterState.nodes()).add(localNode).localNodeId(localNode.getId());
         this.clusterState = ClusterState.builder(clusterState).nodes(nodeBuilder).build();
     }
 
@@ -411,7 +413,8 @@ public class ClusterService extends AbstractLifecycleComponent {
                 List<UpdateTask> existingTasks = updateTasksPerExecutor.computeIfAbsent(executor, k -> new ArrayList<>());
                 for (@SuppressWarnings("unchecked") UpdateTask<T> existing : existingTasks) {
                     if (tasksIdentity.containsKey(existing.task)) {
-                        throw new IllegalStateException("task [" + existing.task + "] with source [" + source + "] is already queued");
+                        throw new IllegalStateException("task [" + executor.describeTasks(Collections.singletonList(existing.task)) +
+                            "] with source [" + source + "] is already queued");
                     }
                 }
                 existingTasks.addAll(updateTasks);
@@ -517,11 +520,11 @@ public class ClusterService extends AbstractLifecycleComponent {
             if (pending != null) {
                 for (UpdateTask<T> task : pending) {
                     if (task.processed.getAndSet(true) == false) {
-                        logger.trace("will process [{}[{}]]", task.source, task.task);
+                        logger.trace("will process {}", task.toString(executor));
                         toExecute.add(task);
                         processTasksBySource.computeIfAbsent(task.source, s -> new ArrayList<>()).add(task.task);
                     } else {
-                        logger.trace("skipping [{}[{}]], already processed", task.source, task.task);
+                        logger.trace("skipping {}, already processed", task.toString(executor));
                     }
                 }
             }
@@ -553,9 +556,16 @@ public class ClusterService extends AbstractLifecycleComponent {
         } catch (Exception e) {
             TimeValue executionTime = TimeValue.timeValueMillis(Math.max(0, TimeValue.nsecToMSec(currentTimeInNanos() - startTimeNS)));
             if (logger.isTraceEnabled()) {
-                logger.trace("failed to execute cluster state update in [{}], state:\nversion [{}], source [{}]\n{}{}{}", e, executionTime,
-                        previousClusterState.version(), tasksSummary, previousClusterState.nodes().prettyPrint(),
-                        previousClusterState.routingTable().prettyPrint(), previousClusterState.getRoutingNodes().prettyPrint());
+                logger.trace(
+                    (Supplier<?>) () -> new ParameterizedMessage(
+                        "failed to execute cluster state update in [{}], state:\nversion [{}], source [{}]\n{}{}{}",
+                        executionTime,
+                        previousClusterState.version(),
+                        tasksSummary,
+                        previousClusterState.nodes().prettyPrint(),
+                        previousClusterState.routingTable().prettyPrint(),
+                        previousClusterState.getRoutingNodes().prettyPrint()),
+                    e);
             }
             warnAboutSlowTaskIfNeeded(executionTime, tasksSummary);
             batchResult = ClusterStateTaskExecutor.BatchResult.<T>builder()
@@ -571,7 +581,8 @@ public class ClusterService extends AbstractLifecycleComponent {
         assert (assertsEnabled = true);
         if (assertsEnabled) {
             for (UpdateTask<T> updateTask : toExecute) {
-                assert batchResult.executionResults.containsKey(updateTask.task) : "missing task result for [" + updateTask.task + "]";
+                assert batchResult.executionResults.containsKey(updateTask.task) :
+                    "missing task result for " + updateTask.toString(executor);
             }
         }
 
@@ -579,13 +590,15 @@ public class ClusterService extends AbstractLifecycleComponent {
         final ArrayList<UpdateTask<T>> proccessedListeners = new ArrayList<>();
         // fail all tasks that have failed and extract those that are waiting for results
         for (UpdateTask<T> updateTask : toExecute) {
-            assert batchResult.executionResults.containsKey(updateTask.task) : "missing " + updateTask.task.toString();
+            assert batchResult.executionResults.containsKey(updateTask.task) : "missing " + updateTask.toString(executor);
             final ClusterStateTaskExecutor.TaskResult executionResult =
                     batchResult.executionResults.get(updateTask.task);
             executionResult.handle(
                     () -> proccessedListeners.add(updateTask),
                     ex -> {
-                        logger.debug("cluster state update task [{}] failed", ex, updateTask.source);
+                        logger.debug(
+                            (Supplier<?>)
+                                () -> new ParameterizedMessage("cluster state update task {} failed", updateTask.toString(executor)), ex);
                         updateTask.listener.onFailure(updateTask.source, ex);
                     }
             );
@@ -668,7 +681,11 @@ public class ClusterService extends AbstractLifecycleComponent {
                 try {
                     clusterStatePublisher.accept(clusterChangedEvent, ackListener);
                 } catch (Discovery.FailedToCommitClusterStateException t) {
-                    logger.warn("failing [{}]: failed to commit cluster state version [{}]", t, tasksSummary, newClusterState.version());
+                    final long version = newClusterState.version();
+                    logger.warn(
+                        (Supplier<?>) () -> new ParameterizedMessage(
+                            "failing [{}]: failed to commit cluster state version [{}]", tasksSummary, version),
+                        t);
                     proccessedListeners.forEach(task -> task.listener.onFailure(task.source, t));
                     return;
                 }
@@ -711,7 +728,10 @@ public class ClusterService extends AbstractLifecycleComponent {
                 try {
                     ackListener.onNodeAck(newClusterState.nodes().getLocalNode(), null);
                 } catch (Exception e) {
-                    logger.debug("error while processing ack for master node [{}]", e, newClusterState.nodes().getLocalNode());
+                    final DiscoveryNode localNode = newClusterState.nodes().getLocalNode();
+                    logger.debug(
+                        (Supplier<?>) () -> new ParameterizedMessage("error while processing ack for master node [{}]", localNode),
+                        e);
                 }
             }
 
@@ -722,7 +742,11 @@ public class ClusterService extends AbstractLifecycleComponent {
             try {
                 executor.clusterStatePublished(clusterChangedEvent);
             } catch (Exception e) {
-                logger.error("exception thrown while notifying executor of new cluster state publication [{}]", e, tasksSummary);
+                logger.error(
+                    (Supplier<?>) () -> new ParameterizedMessage(
+                        "exception thrown while notifying executor of new cluster state publication [{}]",
+                        tasksSummary),
+                    e);
             }
 
             TimeValue executionTime = TimeValue.timeValueMillis(Math.max(0, TimeValue.nsecToMSec(currentTimeInNanos() - startTimeNS)));
@@ -731,8 +755,18 @@ public class ClusterService extends AbstractLifecycleComponent {
             warnAboutSlowTaskIfNeeded(executionTime, tasksSummary);
         } catch (Exception e) {
             TimeValue executionTime = TimeValue.timeValueMillis(Math.max(0, TimeValue.nsecToMSec(currentTimeInNanos() - startTimeNS)));
-            logger.warn("failed to apply updated cluster state in [{}]:\nversion [{}], uuid [{}], source [{}]\n{}", e, executionTime,
-                    newClusterState.version(), newClusterState.stateUUID(), tasksSummary, newClusterState.prettyPrint());
+            final long version = newClusterState.version();
+            final String stateUUID = newClusterState.stateUUID();
+            final String prettyPrint = newClusterState.prettyPrint();
+            logger.warn(
+                (Supplier<?>) () -> new ParameterizedMessage(
+                    "failed to apply updated cluster state in [{}]:\nversion [{}], uuid [{}], source [{}]\n{}",
+                    executionTime,
+                    version,
+                    stateUUID,
+                    tasksSummary,
+                    prettyPrint),
+                e);
             // TODO: do we want to call updateTask.onFailure here?
         }
 
@@ -741,7 +775,7 @@ public class ClusterService extends AbstractLifecycleComponent {
     // this one is overridden in tests so we can control time
     protected long currentTimeInNanos() {return System.nanoTime();}
 
-    private static SafeClusterStateTaskListener safe(ClusterStateTaskListener listener, ESLogger logger) {
+    private static SafeClusterStateTaskListener safe(ClusterStateTaskListener listener, Logger logger) {
         if (listener instanceof AckedClusterStateTaskListener) {
             return new SafeAckedClusterStateTaskListener((AckedClusterStateTaskListener) listener, logger);
         } else {
@@ -751,9 +785,9 @@ public class ClusterService extends AbstractLifecycleComponent {
 
     private static class SafeClusterStateTaskListener implements ClusterStateTaskListener {
         private final ClusterStateTaskListener listener;
-        private final ESLogger logger;
+        private final Logger logger;
 
-        public SafeClusterStateTaskListener(ClusterStateTaskListener listener, ESLogger logger) {
+        public SafeClusterStateTaskListener(ClusterStateTaskListener listener, Logger logger) {
             this.listener = listener;
             this.logger = logger;
         }
@@ -764,7 +798,9 @@ public class ClusterService extends AbstractLifecycleComponent {
                 listener.onFailure(source, e);
             } catch (Exception inner) {
                 inner.addSuppressed(e);
-                logger.error("exception thrown by listener notifying of failure from [{}]", inner, source);
+                logger.error(
+                    (Supplier<?>) () -> new ParameterizedMessage(
+                        "exception thrown by listener notifying of failure from [{}]", source), inner);
             }
         }
 
@@ -773,7 +809,9 @@ public class ClusterService extends AbstractLifecycleComponent {
             try {
                 listener.onNoLongerMaster(source);
             } catch (Exception e) {
-                logger.error("exception thrown by listener while notifying no longer master from [{}]", e, source);
+                logger.error(
+                    (Supplier<?>) () -> new ParameterizedMessage(
+                            "exception thrown by listener while notifying no longer master from [{}]", source), e);
             }
         }
 
@@ -783,21 +821,22 @@ public class ClusterService extends AbstractLifecycleComponent {
                 listener.clusterStateProcessed(source, oldState, newState);
             } catch (Exception e) {
                 logger.error(
+                    (Supplier<?>) () -> new ParameterizedMessage(
                         "exception thrown by listener while notifying of cluster state processed from [{}], old cluster state:\n" +
-                                "{}\nnew cluster state:\n{}",
-                        e,
+                            "{}\nnew cluster state:\n{}",
                         source,
                         oldState.prettyPrint(),
-                        newState.prettyPrint());
+                        newState.prettyPrint()),
+                    e);
             }
         }
     }
 
     private static class SafeAckedClusterStateTaskListener extends SafeClusterStateTaskListener implements AckedClusterStateTaskListener {
         private final AckedClusterStateTaskListener listener;
-        private final ESLogger logger;
+        private final Logger logger;
 
-        public SafeAckedClusterStateTaskListener(AckedClusterStateTaskListener listener, ESLogger logger) {
+        public SafeAckedClusterStateTaskListener(AckedClusterStateTaskListener listener, Logger logger) {
             super(listener, logger);
             this.listener = listener;
             this.logger = logger;
@@ -853,6 +892,15 @@ public class ClusterService extends AbstractLifecycleComponent {
         @Override
         public void run() {
             runTasksForExecutor(executor);
+        }
+
+        public String toString(ClusterStateTaskExecutor<T> executor) {
+            String taskDescription = executor.describeTasks(Collections.singletonList(task));
+            if (taskDescription.isEmpty()) {
+                return "[" + source + "]";
+            } else {
+                return "[" + source + "[" + taskDescription + "]]";
+            }
         }
     }
 
@@ -985,7 +1033,7 @@ public class ClusterService extends AbstractLifecycleComponent {
 
     private static class AckCountDownListener implements Discovery.AckListener {
 
-        private static final ESLogger logger = Loggers.getLogger(AckCountDownListener.class);
+        private static final Logger logger = Loggers.getLogger(AckCountDownListener.class);
 
         private final AckedClusterStateTaskListener ackedTaskListener;
         private final CountDown countDown;
@@ -1029,7 +1077,10 @@ public class ClusterService extends AbstractLifecycleComponent {
                 logger.trace("ack received from node [{}], cluster_state update (version: {})", node, clusterStateVersion);
             } else {
                 this.lastFailure = e;
-                logger.debug("ack received from node [{}], cluster_state update (version: {})", e, node, clusterStateVersion);
+                logger.debug(
+                    (Supplier<?>) () -> new ParameterizedMessage(
+                        "ack received from node [{}], cluster_state update (version: {})", node, clusterStateVersion),
+                    e);
             }
 
             if (countDown.countDown()) {

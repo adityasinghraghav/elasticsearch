@@ -32,6 +32,12 @@ import java.util.regex.Matcher
  * Generates REST tests for each snippet marked // TEST.
  */
 public class RestTestsFromSnippetsTask extends SnippetsTask {
+    /**
+     * These languages aren't supported by the syntax highlighter so we
+     * shouldn't use them.
+     */
+    private static final List BAD_LANGUAGES = ['json', 'javascript']
+
     @Input
     Map<String, String> setups = new HashMap()
 
@@ -87,9 +93,9 @@ public class RestTestsFromSnippetsTask extends SnippetsTask {
          * calls buildTest to actually build the test.
          */
         void handleSnippet(Snippet snippet) {
-            if (snippet.language == 'json') {
+            if (BAD_LANGUAGES.contains(snippet.language)) {
                 throw new InvalidUserDataException(
-                        "$snippet: Use `js` instead of `json`.")
+                        "$snippet: Use `js` instead of `${snippet.language}`.")
             }
             if (snippet.testSetup) {
                 setup(snippet)
@@ -111,7 +117,7 @@ public class RestTestsFromSnippetsTask extends SnippetsTask {
 
             if (false == test.continued) {
                 current.println('---')
-                current.println("\"$test.start\":")
+                current.println("\"line_$test.start\":")
             }
             if (test.skipTest) {
                 current.println("  - skip:")
@@ -119,6 +125,7 @@ public class RestTestsFromSnippetsTask extends SnippetsTask {
                 current.println("      reason: $test.skipTest")
             }
             if (test.setup != null) {
+                // Insert a setup defined outside of the docs
                 String setup = setups[test.setup]
                 if (setup == null) {
                     throw new InvalidUserDataException("Couldn't find setup "
@@ -136,12 +143,25 @@ public class RestTestsFromSnippetsTask extends SnippetsTask {
             response.contents.eachLine { current.println("        $it") }
         }
 
-        void emitDo(String method, String pathAndQuery,
-                String body, String catchPart, boolean inSetup) {
+        void emitDo(String method, String pathAndQuery, String body,
+                String catchPart, List warnings, boolean inSetup) {
             def (String path, String query) = pathAndQuery.tokenize('?')
+            if (path == null) {
+                path = '' // Catch requests to the root...
+            }
             current.println("  - do:")
             if (catchPart != null) {
                 current.println("      catch: $catchPart")
+            }
+            if (false == warnings.isEmpty()) {
+                current.println("      warnings:")
+                for (String warning in warnings) {
+                    // Escape " because we're going to quote the warning
+                    String escaped = warning.replaceAll('"', '\\\\"')
+                    /* Quote the warning in case it starts with [ which makes
+                     * it look too much like an array. */
+                    current.println("         - \"$escaped\"")
+                }
             }
             current.println("      raw:")
             current.println("        method: $method")
@@ -184,13 +204,6 @@ public class RestTestsFromSnippetsTask extends SnippetsTask {
             current.println('---')
             current.println("setup:")
             body(setup, true)
-            // always wait for yellow before anything is executed
-            current.println(
-                    "  - do:\n" +
-                    "      raw:\n" +
-                    "        method: GET\n" +
-                    "        path: \"_cluster/health\"\n" +
-                    "        wait_for_status: \"yellow\"")
         }
 
         private void body(Snippet snippet, boolean inSetup) {
@@ -207,7 +220,8 @@ public class RestTestsFromSnippetsTask extends SnippetsTask {
                     // Leading '/'s break the generated paths
                     pathAndQuery = pathAndQuery.substring(1)
                 }
-                emitDo(method, pathAndQuery, body, catchPart, inSetup)
+                emitDo(method, pathAndQuery, body, catchPart, snippet.warnings,
+                    inSetup)
             }
         }
 

@@ -28,11 +28,11 @@ import org.elasticsearch.script.MockScriptPlugin;
 import org.elasticsearch.script.Script;
 import org.elasticsearch.script.ScriptService.ScriptType;
 import org.elasticsearch.search.aggregations.bucket.histogram.Histogram;
-import org.elasticsearch.search.aggregations.bucket.histogram.InternalHistogram;
-import org.elasticsearch.search.aggregations.bucket.histogram.InternalHistogram.Bucket;
+import org.elasticsearch.search.aggregations.bucket.range.Range;
 import org.elasticsearch.search.aggregations.metrics.sum.Sum;
 import org.elasticsearch.search.aggregations.pipeline.BucketHelpers.GapPolicy;
 import org.elasticsearch.test.ESIntegTestCase;
+import org.joda.time.DateTime;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -44,6 +44,7 @@ import java.util.Map;
 import java.util.function.Function;
 
 import static org.elasticsearch.common.xcontent.XContentFactory.jsonBuilder;
+import static org.elasticsearch.search.aggregations.AggregationBuilders.dateRange;
 import static org.elasticsearch.search.aggregations.AggregationBuilders.histogram;
 import static org.elasticsearch.search.aggregations.AggregationBuilders.sum;
 import static org.elasticsearch.search.aggregations.pipeline.PipelineAggregatorBuilders.bucketScript;
@@ -60,11 +61,13 @@ public class BucketScriptIT extends ESIntegTestCase {
     private static final String FIELD_2_NAME = "field2";
     private static final String FIELD_3_NAME = "field3";
     private static final String FIELD_4_NAME = "field4";
+    private static final String FIELD_5_NAME = "field5";
 
     private static int interval;
     private static int numDocs;
     private static int minNumber;
     private static int maxNumber;
+    private static long date;
 
     @Override
     protected Collection<Class<? extends Plugin>> nodePlugins() {
@@ -127,6 +130,7 @@ public class BucketScriptIT extends ESIntegTestCase {
         numDocs = randomIntBetween(10, 500);
         minNumber = -200;
         maxNumber = 200;
+        date = randomLong();
 
         List<IndexRequestBuilder> builders = new ArrayList<>();
         for (int docs = 0; docs < numDocs; docs++) {
@@ -144,6 +148,7 @@ public class BucketScriptIT extends ESIntegTestCase {
         jsonBuilder.field(FIELD_2_NAME, randomIntBetween(minNumber, maxNumber));
         jsonBuilder.field(FIELD_3_NAME, randomIntBetween(minNumber, maxNumber));
         jsonBuilder.field(FIELD_4_NAME, randomIntBetween(minNumber, maxNumber));
+        jsonBuilder.field(FIELD_5_NAME, date);
         jsonBuilder.endObject();
         return jsonBuilder;
     }
@@ -166,10 +171,10 @@ public class BucketScriptIT extends ESIntegTestCase {
 
         assertSearchResponse(response);
 
-        InternalHistogram<Bucket> histo = response.getAggregations().get("histo");
+        Histogram histo = response.getAggregations().get("histo");
         assertThat(histo, notNullValue());
         assertThat(histo.getName(), equalTo("histo"));
-        List<? extends Bucket> buckets = histo.getBuckets();
+        List<? extends Histogram.Bucket> buckets = histo.getBuckets();
 
         for (int i = 0; i < buckets.size(); ++i) {
             Histogram.Bucket bucket = buckets.get(i);
@@ -212,10 +217,10 @@ public class BucketScriptIT extends ESIntegTestCase {
 
         assertSearchResponse(response);
 
-        InternalHistogram<Bucket> histo = response.getAggregations().get("histo");
+        Histogram histo = response.getAggregations().get("histo");
         assertThat(histo, notNullValue());
         assertThat(histo.getName(), equalTo("histo"));
-        List<? extends Bucket> buckets = histo.getBuckets();
+        List<? extends Histogram.Bucket> buckets = histo.getBuckets();
 
         for (int i = 0; i < buckets.size(); ++i) {
             Histogram.Bucket bucket = buckets.get(i);
@@ -240,6 +245,52 @@ public class BucketScriptIT extends ESIntegTestCase {
         }
     }
 
+    public void testInlineScriptWithDateRange() {
+        SearchResponse response = client()
+            .prepareSearch("idx")
+            .addAggregation(
+                dateRange("range")
+                    .field(FIELD_5_NAME)
+                    .addUnboundedFrom(date)
+                    .subAggregation(sum("field2Sum").field(FIELD_2_NAME))
+                    .subAggregation(sum("field3Sum").field(FIELD_3_NAME))
+                    .subAggregation(sum("field4Sum").field(FIELD_4_NAME))
+                    .subAggregation(
+                        bucketScript("seriesArithmetic",
+                            new Script("_value0 + _value1 + _value2", ScriptType.INLINE, CustomScriptPlugin.NAME, null)
+                            , "field2Sum", "field3Sum", "field4Sum")))
+            .execute().actionGet();
+
+        assertSearchResponse(response);
+
+        Range range = response.getAggregations().get("range");
+        assertThat(range, notNullValue());
+        assertThat(range.getName(), equalTo("range"));
+        List<? extends Range.Bucket> buckets = range.getBuckets();
+
+        for (int i = 0; i < buckets.size(); ++i) {
+            Range.Bucket bucket = buckets.get(i);
+            if (bucket.getDocCount() == 0) {
+                SimpleValue seriesArithmetic = bucket.getAggregations().get("seriesArithmetic");
+                assertThat(seriesArithmetic, nullValue());
+            } else {
+                Sum field2Sum = bucket.getAggregations().get("field2Sum");
+                assertThat(field2Sum, notNullValue());
+                double field2SumValue = field2Sum.getValue();
+                Sum field3Sum = bucket.getAggregations().get("field3Sum");
+                assertThat(field3Sum, notNullValue());
+                double field3SumValue = field3Sum.getValue();
+                Sum field4Sum = bucket.getAggregations().get("field4Sum");
+                assertThat(field4Sum, notNullValue());
+                double field4SumValue = field4Sum.getValue();
+                SimpleValue seriesArithmetic = bucket.getAggregations().get("seriesArithmetic");
+                assertThat(seriesArithmetic, notNullValue());
+                double seriesArithmeticValue = seriesArithmetic.value();
+                assertThat(seriesArithmeticValue, equalTo(field2SumValue + field3SumValue + field4SumValue));
+            }
+        }
+    }
+
     public void testInlineScriptSingleVariable() {
         SearchResponse response = client()
                 .prepareSearch("idx")
@@ -256,10 +307,10 @@ public class BucketScriptIT extends ESIntegTestCase {
 
         assertSearchResponse(response);
 
-        InternalHistogram<Bucket> histo = response.getAggregations().get("histo");
+        Histogram histo = response.getAggregations().get("histo");
         assertThat(histo, notNullValue());
         assertThat(histo.getName(), equalTo("histo"));
-        List<? extends Bucket> buckets = histo.getBuckets();
+        List<? extends Histogram.Bucket> buckets = histo.getBuckets();
 
         for (int i = 0; i < buckets.size(); ++i) {
             Histogram.Bucket bucket = buckets.get(i);
@@ -299,10 +350,10 @@ public class BucketScriptIT extends ESIntegTestCase {
 
         assertSearchResponse(response);
 
-        InternalHistogram<Bucket> histo = response.getAggregations().get("histo");
+        Histogram histo = response.getAggregations().get("histo");
         assertThat(histo, notNullValue());
         assertThat(histo.getName(), equalTo("histo"));
-        List<? extends Bucket> buckets = histo.getBuckets();
+        List<? extends Histogram.Bucket> buckets = histo.getBuckets();
 
         for (int i = 0; i < buckets.size(); ++i) {
             Histogram.Bucket bucket = buckets.get(i);
@@ -347,10 +398,10 @@ public class BucketScriptIT extends ESIntegTestCase {
 
         assertSearchResponse(response);
 
-        InternalHistogram<Bucket> histo = response.getAggregations().get("histo");
+        Histogram histo = response.getAggregations().get("histo");
         assertThat(histo, notNullValue());
         assertThat(histo.getName(), equalTo("histo"));
-        List<? extends Bucket> buckets = histo.getBuckets();
+        List<? extends Histogram.Bucket> buckets = histo.getBuckets();
 
         for (int i = 0; i < buckets.size(); ++i) {
             Histogram.Bucket bucket = buckets.get(i);
@@ -393,10 +444,10 @@ public class BucketScriptIT extends ESIntegTestCase {
 
         assertSearchResponse(response);
 
-        InternalHistogram<Bucket> histo = response.getAggregations().get("histo");
+        Histogram histo = response.getAggregations().get("histo");
         assertThat(histo, notNullValue());
         assertThat(histo.getName(), equalTo("histo"));
-        List<? extends Bucket> buckets = histo.getBuckets();
+        List<? extends Histogram.Bucket> buckets = histo.getBuckets();
 
         for (int i = 0; i < buckets.size(); ++i) {
             Histogram.Bucket bucket = buckets.get(i);
@@ -446,10 +497,10 @@ public class BucketScriptIT extends ESIntegTestCase {
 
         assertSearchResponse(response);
 
-        InternalHistogram<Bucket> histo = response.getAggregations().get("histo");
+        Histogram histo = response.getAggregations().get("histo");
         assertThat(histo, notNullValue());
         assertThat(histo.getName(), equalTo("histo"));
-        List<? extends Bucket> buckets = histo.getBuckets();
+        List<? extends Histogram.Bucket> buckets = histo.getBuckets();
 
         for (int i = 0; i < buckets.size(); ++i) {
             Histogram.Bucket bucket = buckets.get(i);
@@ -492,7 +543,7 @@ public class BucketScriptIT extends ESIntegTestCase {
 
         assertSearchResponse(response);
 
-        InternalHistogram<Bucket> deriv = response.getAggregations().get("histo");
+        Histogram deriv = response.getAggregations().get("histo");
         assertThat(deriv, notNullValue());
         assertThat(deriv.getName(), equalTo("histo"));
         assertThat(deriv.getBuckets().size(), equalTo(0));
@@ -515,10 +566,10 @@ public class BucketScriptIT extends ESIntegTestCase {
 
         assertSearchResponse(response);
 
-        InternalHistogram<Bucket> histo = response.getAggregations().get("histo");
+        Histogram histo = response.getAggregations().get("histo");
         assertThat(histo, notNullValue());
         assertThat(histo.getName(), equalTo("histo"));
-        List<? extends Bucket> buckets = histo.getBuckets();
+        List<? extends Histogram.Bucket> buckets = histo.getBuckets();
 
         for (int i = 0; i < buckets.size(); ++i) {
             Histogram.Bucket bucket = buckets.get(i);

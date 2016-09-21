@@ -30,17 +30,22 @@ import org.joda.time.DateTimeZone;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.TreeMap;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
 import static org.hamcrest.Matchers.closeTo;
 import static org.hamcrest.Matchers.endsWith;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.is;
-import static org.hamcrest.Matchers.startsWith;
 
 /**
  * Tests for {@link BytesStreamOutput} paging behaviour.
@@ -266,6 +271,7 @@ public class BytesStreamsTests extends ESTestCase {
         out.writeVInt(2);
         out.writeLong(-3);
         out.writeVLong(4);
+        out.writeOptionalLong(11234234L);
         out.writeFloat(1.1f);
         out.writeDouble(2.2);
         int[] intArray = {1, 2, 3};
@@ -299,8 +305,9 @@ public class BytesStreamsTests extends ESTestCase {
         assertThat(in.readShort(), equalTo((short)-1));
         assertThat(in.readInt(), equalTo(-1));
         assertThat(in.readVInt(), equalTo(2));
-        assertThat(in.readLong(), equalTo((long)-3));
-        assertThat(in.readVLong(), equalTo((long)4));
+        assertThat(in.readLong(), equalTo(-3L));
+        assertThat(in.readVLong(), equalTo(4L));
+        assertThat(in.readOptionalLong(), equalTo(11234234L));
         assertThat((double)in.readFloat(), closeTo(1.1, 0.0001));
         assertThat(in.readDouble(), closeTo(2.2, 0.0001));
         assertThat(in.readGenericValue(), equalTo((Object) intArray));
@@ -327,57 +334,35 @@ public class BytesStreamsTests extends ESTestCase {
 
     public void testNamedWriteable() throws IOException {
         BytesStreamOutput out = new BytesStreamOutput();
-        NamedWriteableRegistry namedWriteableRegistry = new NamedWriteableRegistry();
-        namedWriteableRegistry.register(BaseNamedWriteable.class, TestNamedWriteable.NAME, TestNamedWriteable::new);
+        NamedWriteableRegistry namedWriteableRegistry = new NamedWriteableRegistry(Collections.singletonList(
+            new NamedWriteableRegistry.Entry(BaseNamedWriteable.class, TestNamedWriteable.NAME, TestNamedWriteable::new)
+        ));
         TestNamedWriteable namedWriteableIn = new TestNamedWriteable(randomAsciiOfLengthBetween(1, 10), randomAsciiOfLengthBetween(1, 10));
         out.writeNamedWriteable(namedWriteableIn);
         byte[] bytes = BytesReference.toBytes(out.bytes());
         StreamInput in = new NamedWriteableAwareStreamInput(StreamInput.wrap(bytes), namedWriteableRegistry);
         assertEquals(in.available(), bytes.length);
         BaseNamedWriteable namedWriteableOut = in.readNamedWriteable(BaseNamedWriteable.class);
-        assertEquals(namedWriteableOut, namedWriteableIn);
-        assertEquals(in.available(), 0);
+        assertEquals(namedWriteableIn, namedWriteableOut);
+        assertEquals(0, in.available());
     }
 
-    public void testNamedWriteableDuplicates() throws IOException {
-        NamedWriteableRegistry namedWriteableRegistry = new NamedWriteableRegistry();
-        namedWriteableRegistry.register(BaseNamedWriteable.class, TestNamedWriteable.NAME, TestNamedWriteable::new);
-        IllegalArgumentException e = expectThrows(IllegalArgumentException.class,
-                () -> namedWriteableRegistry.register(BaseNamedWriteable.class, TestNamedWriteable.NAME, TestNamedWriteable::new));
-        assertThat(e.getMessage(), startsWith("named writeable [" + BaseNamedWriteable.class.getName() + "][" + TestNamedWriteable.NAME
-                + "] is already registered by ["));
-    }
+    public void testNamedWriteableList() throws IOException {
+        NamedWriteableRegistry namedWriteableRegistry = new NamedWriteableRegistry(Collections.singletonList(
+            new NamedWriteableRegistry.Entry(BaseNamedWriteable.class, TestNamedWriteable.NAME, TestNamedWriteable::new)
+        ));
+        int size = between(0, 100);
+        List<BaseNamedWriteable> expected = new ArrayList<>(size);
+        for (int i = 0; i < size; i++) {
+            expected.add(new TestNamedWriteable(randomAsciiOfLengthBetween(1, 10), randomAsciiOfLengthBetween(1, 10)));
+        }
 
-    public void testNamedWriteableUnknownCategory() throws IOException {
-        BytesStreamOutput out = new BytesStreamOutput();
-        out.writeNamedWriteable(new TestNamedWriteable("test1", "test2"));
-        StreamInput in = new NamedWriteableAwareStreamInput(out.bytes().streamInput(), new NamedWriteableRegistry());
-        //no named writeable registered with given name, can write but cannot read it back
-        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> in.readNamedWriteable(BaseNamedWriteable.class));
-        assertThat(e.getMessage(), equalTo("unknown named writeable category [" + BaseNamedWriteable.class.getName() + "]"));
-    }
-
-    public void testNamedWriteableUnknownNamedWriteable() throws IOException {
-        NamedWriteableRegistry namedWriteableRegistry = new NamedWriteableRegistry();
-        namedWriteableRegistry.register(BaseNamedWriteable.class, TestNamedWriteable.NAME, TestNamedWriteable::new);
-        BytesStreamOutput out = new BytesStreamOutput();
-        out.writeNamedWriteable(new NamedWriteable() {
-            @Override
-            public String getWriteableName() {
-                return "unknown";
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            out.writeNamedWriteableList(expected);
+            try (StreamInput in = new NamedWriteableAwareStreamInput(out.bytes().streamInput(), namedWriteableRegistry)) {
+                assertEquals(expected, in.readNamedWriteableList(BaseNamedWriteable.class));
+                assertEquals(0, in.available());
             }
-
-            @Override
-            public void writeTo(StreamOutput out) throws IOException {
-            }
-        });
-        StreamInput in = new NamedWriteableAwareStreamInput(StreamInput.wrap(BytesReference.toBytes(out.bytes())), namedWriteableRegistry);
-        try {
-            //no named writeable registered with given name under test category, can write but cannot read it back
-            in.readNamedWriteable(BaseNamedWriteable.class);
-            fail("read should have failed");
-        } catch(IllegalArgumentException e) {
-            assertThat(e.getMessage(), equalTo("unknown named writeable [" + BaseNamedWriteable.class.getName() + "][unknown]"));
         }
     }
 
@@ -396,8 +381,9 @@ public class BytesStreamsTests extends ESTestCase {
 
     public void testNamedWriteableReaderReturnsNull() throws IOException {
         BytesStreamOutput out = new BytesStreamOutput();
-        NamedWriteableRegistry namedWriteableRegistry = new NamedWriteableRegistry();
-        namedWriteableRegistry.register(BaseNamedWriteable.class, TestNamedWriteable.NAME, (StreamInput in) -> null);
+        NamedWriteableRegistry namedWriteableRegistry = new NamedWriteableRegistry(Collections.singletonList(
+            new NamedWriteableRegistry.Entry(BaseNamedWriteable.class, TestNamedWriteable.NAME, (StreamInput in) -> null)
+        ));
         TestNamedWriteable namedWriteableIn = new TestNamedWriteable(randomAsciiOfLengthBetween(1, 10), randomAsciiOfLengthBetween(1, 10));
         out.writeNamedWriteable(namedWriteableIn);
         byte[] bytes = BytesReference.toBytes(out.bytes());
@@ -417,13 +403,15 @@ public class BytesStreamsTests extends ESTestCase {
 
     public void testWriteableReaderReturnsWrongName() throws IOException {
         BytesStreamOutput out = new BytesStreamOutput();
-        NamedWriteableRegistry namedWriteableRegistry = new NamedWriteableRegistry();
-        namedWriteableRegistry.register(BaseNamedWriteable.class, TestNamedWriteable.NAME, (StreamInput in) -> new TestNamedWriteable(in) {
-            @Override
-            public String getWriteableName() {
-                return "intentionally-broken";
-            }
-        });
+        NamedWriteableRegistry namedWriteableRegistry = new NamedWriteableRegistry(Collections.singletonList(
+            new NamedWriteableRegistry.Entry(BaseNamedWriteable.class, TestNamedWriteable.NAME, (StreamInput in) ->
+                new TestNamedWriteable(in) {
+                    @Override
+                    public String getWriteableName() {
+                    return "intentionally-broken";
+                }
+                })
+        ));
         TestNamedWriteable namedWriteableIn = new TestNamedWriteable(randomAsciiOfLengthBetween(1, 10), randomAsciiOfLengthBetween(1, 10));
         out.writeNamedWriteable(namedWriteableIn);
         byte[] bytes = BytesReference.toBytes(out.bytes());
@@ -477,11 +465,11 @@ public class BytesStreamsTests extends ESTestCase {
         }
 
         final BytesStreamOutput out = new BytesStreamOutput();
-        out.writeMapOfLists(expected);
+        out.writeMapOfLists(expected, StreamOutput::writeString, StreamOutput::writeString);
 
         final StreamInput in = StreamInput.wrap(BytesReference.toBytes(out.bytes()));
 
-        final Map<String, List<String>> loaded = in.readMapOfLists();
+        final Map<String, List<String>> loaded = in.readMapOfLists(StreamInput::readString, StreamInput::readString);
 
         assertThat(loaded.size(), equalTo(expected.size()));
 
@@ -636,5 +624,51 @@ public class BytesStreamsTests extends ESTestCase {
         public void writeTo(StreamOutput out) throws IOException {
             out.writeBoolean(value);
         }
+    }
+
+    public void testWriteMapWithConsistentOrder() throws IOException {
+        Map<String, String> map =
+            randomMap(new TreeMap<>(), randomIntBetween(2, 20),
+                () -> randomAsciiOfLength(5),
+                () -> randomAsciiOfLength(5));
+
+        Map<String, Object> reverseMap = new TreeMap<>(Collections.reverseOrder());
+        reverseMap.putAll(map);
+
+        List<String> mapKeys = map.entrySet().stream().map(Map.Entry::getKey).collect(Collectors.toList());
+        List<String> reverseMapKeys = reverseMap.entrySet().stream().map(Map.Entry::getKey).collect(Collectors.toList());
+
+        assertNotEquals(mapKeys, reverseMapKeys);
+
+        BytesStreamOutput output = new BytesStreamOutput();
+        BytesStreamOutput reverseMapOutput = new BytesStreamOutput();
+        output.writeMapWithConsistentOrder(map);
+        reverseMapOutput.writeMapWithConsistentOrder(reverseMap);
+
+        assertEquals(output.bytes(), reverseMapOutput.bytes());
+    }
+
+    public void testReadMapByUsingWriteMapWithConsistentOrder() throws IOException {
+        Map<String, String> streamOutMap =
+            randomMap(new HashMap<>(), randomIntBetween(2, 20),
+                () -> randomAsciiOfLength(5),
+                () -> randomAsciiOfLength(5));
+        BytesStreamOutput streamOut = new BytesStreamOutput();
+        streamOut.writeMapWithConsistentOrder(streamOutMap);
+        StreamInput in = StreamInput.wrap(BytesReference.toBytes(streamOut.bytes()));
+        Map<String, Object> streamInMap = in.readMap();
+        assertEquals(streamOutMap, streamInMap);
+    }
+
+    public void testWriteMapWithConsistentOrderWithLinkedHashMapShouldThrowAssertError() throws IOException {
+        BytesStreamOutput output = new BytesStreamOutput();
+        Map<String, Object> map = new LinkedHashMap<>();
+        Throwable e = expectThrows(AssertionError.class, () -> output.writeMapWithConsistentOrder(map));
+        assertEquals(AssertionError.class, e.getClass());
+    }
+
+    private static <K, V> Map<K, V> randomMap(Map<K, V> map, int size, Supplier<K> keyGenerator, Supplier<V> valueGenerator) {
+        IntStream.range(0, size).forEach(i -> map.put(keyGenerator.get(), valueGenerator.get()));
+        return map;
     }
 }

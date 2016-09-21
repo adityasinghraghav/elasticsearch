@@ -19,6 +19,7 @@
 package org.elasticsearch.index.replication;
 
 import org.apache.lucene.document.Document;
+import org.apache.lucene.index.IndexNotFoundException;
 import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.store.AlreadyClosedException;
@@ -28,6 +29,7 @@ import org.apache.lucene.util.IOUtils;
 import org.elasticsearch.ExceptionsHelper;
 import org.elasticsearch.Version;
 import org.elasticsearch.action.ActionListener;
+import org.elasticsearch.action.DocWriteResponse;
 import org.elasticsearch.action.admin.indices.flush.FlushRequest;
 import org.elasticsearch.action.index.IndexRequest;
 import org.elasticsearch.action.index.IndexResponse;
@@ -39,6 +41,8 @@ import org.elasticsearch.action.support.replication.TransportWriteAction;
 import org.elasticsearch.cluster.ClusterState;
 import org.elasticsearch.cluster.metadata.IndexMetaData;
 import org.elasticsearch.cluster.node.DiscoveryNode;
+import org.elasticsearch.cluster.routing.RecoverySource.PeerRecoverySource;
+import org.elasticsearch.cluster.routing.RecoverySource.StoreRecoverySource;
 import org.elasticsearch.cluster.routing.ShardRouting;
 import org.elasticsearch.cluster.routing.ShardRoutingHelper;
 import org.elasticsearch.cluster.routing.ShardRoutingState;
@@ -58,9 +62,10 @@ import org.elasticsearch.index.cache.query.DisabledQueryCache;
 import org.elasticsearch.index.engine.Engine;
 import org.elasticsearch.index.mapper.MapperService;
 import org.elasticsearch.index.mapper.Uid;
-import org.elasticsearch.index.mapper.internal.UidFieldMapper;
+import org.elasticsearch.index.mapper.UidFieldMapper;
 import org.elasticsearch.index.shard.IndexEventListener;
 import org.elasticsearch.index.shard.IndexShard;
+import org.elasticsearch.index.shard.IndexShardState;
 import org.elasticsearch.index.shard.ShardId;
 import org.elasticsearch.index.shard.ShardPath;
 import org.elasticsearch.index.similarity.SimilarityService;
@@ -70,7 +75,7 @@ import org.elasticsearch.indices.recovery.RecoveryFailedException;
 import org.elasticsearch.indices.recovery.RecoverySourceHandler;
 import org.elasticsearch.indices.recovery.RecoveryState;
 import org.elasticsearch.indices.recovery.RecoveryTarget;
-import org.elasticsearch.indices.recovery.RecoveryTargetService;
+import org.elasticsearch.indices.recovery.PeerRecoveryTargetService;
 import org.elasticsearch.indices.recovery.StartRecoveryRequest;
 import org.elasticsearch.test.DummyShardLock;
 import org.elasticsearch.test.ESTestCase;
@@ -78,8 +83,6 @@ import org.elasticsearch.test.junit.annotations.TestLogging;
 import org.elasticsearch.threadpool.TestThreadPool;
 import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.transport.TransportResponse;
-import org.junit.After;
-import org.junit.Before;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -106,11 +109,11 @@ import static org.hamcrest.Matchers.equalTo;
 
 public abstract class ESIndexLevelReplicationTestCase extends ESTestCase {
 
-    private ThreadPool threadPool;
-    private final Index index = new Index("test", "uuid");
+    protected ThreadPool threadPool;
+    protected final Index index = new Index("test", "uuid");
     private final ShardId shardId = new ShardId(index, 0);
     private final Map<String, String> indexMapping = Collections.singletonMap("type", "{ \"type\": {} }");
-    protected static final RecoveryTargetService.RecoveryListener recoveryListener = new RecoveryTargetService.RecoveryListener() {
+    protected static final PeerRecoveryTargetService.RecoveryListener recoveryListener = new PeerRecoveryTargetService.RecoveryListener() {
         @Override
         public void onRecoveryDone(RecoveryState state) {
 
@@ -136,7 +139,7 @@ public abstract class ESIndexLevelReplicationTestCase extends ESTestCase {
                 new BiFunction<IndexShard, DiscoveryNode, RecoveryTarget>() {
                 @Override
                 public RecoveryTarget apply(IndexShard indexShard, DiscoveryNode node) {
-                    return new RecoveryTarget(indexShard, node, recoveryListener) {
+                    return new RecoveryTarget(indexShard, node, recoveryListener, version -> {}) {
                         @Override
                         public void renameAllTempFiles() throws IOException {
                             super.renameAllTempFiles();
@@ -160,14 +163,15 @@ public abstract class ESIndexLevelReplicationTestCase extends ESTestCase {
         }
     }
 
-
-    @Before
-    public void setup() {
+    @Override
+    public void setUp() throws Exception {
+        super.setUp();
         threadPool = new TestThreadPool(getClass().getName());
     }
 
-    @After
-    public void destroy() {
+    @Override
+    public void tearDown() throws Exception {
+        super.tearDown();
         ThreadPool.terminate(threadPool, 30, TimeUnit.SECONDS);
     }
 
@@ -197,8 +201,8 @@ public abstract class ESIndexLevelReplicationTestCase extends ESTestCase {
         return new ReplicationGroup(metaData, homePath);
     }
 
-    private DiscoveryNode getDiscoveryNode(String id) {
-        return new DiscoveryNode(id, id, LocalTransportAddress.buildUnique(), Collections.emptyMap(),
+    protected DiscoveryNode getDiscoveryNode(String id) {
+        return new DiscoveryNode(id, id, new LocalTransportAddress(id), Collections.emptyMap(),
             Collections.singleton(DiscoveryNode.Role.DATA), Version.CURRENT);
     }
 
@@ -206,7 +210,8 @@ public abstract class ESIndexLevelReplicationTestCase extends ESTestCase {
         // add node name to settings for propper logging
         final Settings nodeSettings = Settings.builder().put("node.name", node.getName()).build();
         final IndexSettings indexSettings = new IndexSettings(indexMetaData, nodeSettings);
-        ShardRouting shardRouting = TestShardRouting.newShardRouting(shardId, node.getId(), primary, ShardRoutingState.INITIALIZING);
+        ShardRouting shardRouting = TestShardRouting.newShardRouting(shardId, node.getId(), primary, ShardRoutingState.INITIALIZING,
+            primary ? StoreRecoverySource.EMPTY_STORE_INSTANCE : PeerRecoverySource.INSTANCE);
         final Path path = Files.createDirectories(homePath.resolve(node.getId()));
         final NodeEnvironment.NodePath nodePath = new NodeEnvironment.NodePath(path);
         ShardPath shardPath = new ShardPath(false, nodePath.resolve(shardId), nodePath.resolve(shardId), shardId);
@@ -227,7 +232,7 @@ public abstract class ESIndexLevelReplicationTestCase extends ESTestCase {
     }
 
 
-    class ReplicationGroup implements AutoCloseable, Iterable<IndexShard> {
+    protected class ReplicationGroup implements AutoCloseable, Iterable<IndexShard> {
         private final IndexShard primary;
         private final List<IndexShard> replicas;
         private final IndexMetaData indexMetaData;
@@ -252,7 +257,16 @@ public abstract class ESIndexLevelReplicationTestCase extends ESTestCase {
                 final IndexRequest indexRequest = new IndexRequest(index.getName(), "type", Integer.toString(docId.incrementAndGet()))
                     .source("{}");
                 final IndexResponse response = index(indexRequest);
-                assertThat(response.isCreated(), equalTo(true));
+                assertEquals(DocWriteResponse.Result.CREATED, response.getResult());
+            }
+            return numOfDoc;
+        }
+
+        public int appendDocs(final int numOfDoc) throws Exception {
+            for (int doc = 0; doc < numOfDoc; doc++) {
+                final IndexRequest indexRequest = new IndexRequest(index.getName(), "type").source("{}");
+                final IndexResponse response = index(indexRequest);
+                assertEquals(DocWriteResponse.Result.CREATED, response.getResult());
             }
             return numOfDoc;
         }
@@ -266,11 +280,11 @@ public abstract class ESIndexLevelReplicationTestCase extends ESTestCase {
 
         public synchronized void startAll() throws IOException {
             final DiscoveryNode pNode = getDiscoveryNode(primary.routingEntry().currentNodeId());
-            primary.markAsRecovering("store", new RecoveryState(primary.shardId(), true, RecoveryState.Type.STORE, pNode, pNode));
+            primary.markAsRecovering("store", new RecoveryState(primary.routingEntry(), pNode, null));
             primary.recoverFromStore();
             primary.updateRoutingEntry(ShardRoutingHelper.moveToStarted(primary.routingEntry()));
             for (IndexShard replicaShard : replicas) {
-                recoverReplica(replicaShard, (replica, sourceNode) -> new RecoveryTarget(replica, sourceNode, recoveryListener));
+                recoverReplica(replicaShard);
             }
         }
 
@@ -280,23 +294,53 @@ public abstract class ESIndexLevelReplicationTestCase extends ESTestCase {
             return replica;
         }
 
+        public void recoverReplica(IndexShard replica) throws IOException {
+            recoverReplica(replica, (r, sourceNode) -> new RecoveryTarget(r, sourceNode, recoveryListener, version -> {}));
+        }
+
         public void recoverReplica(IndexShard replica, BiFunction<IndexShard, DiscoveryNode, RecoveryTarget> targetSupplier)
             throws IOException {
-            final DiscoveryNode pNode;
-            synchronized (this) {
-                pNode = getDiscoveryNode(primary.routingEntry().currentNodeId());
-            }
+            recoverReplica(replica, targetSupplier, true);
+        }
+
+        public void recoverReplica(IndexShard replica, BiFunction<IndexShard, DiscoveryNode, RecoveryTarget> targetSupplier,
+                                   boolean markAsRecovering)
+            throws IOException {
+            final DiscoveryNode pNode = getPrimaryNode();
             final DiscoveryNode rNode = getDiscoveryNode(replica.routingEntry().currentNodeId());
-            replica.markAsRecovering("remote", new RecoveryState(replica.shardId(), false, RecoveryState.Type.REPLICA, pNode, rNode));
+            if (markAsRecovering) {
+                replica.markAsRecovering("remote",
+                    new RecoveryState(replica.routingEntry(), pNode, rNode));
+            } else {
+                assertEquals(replica.state(), IndexShardState.RECOVERING);
+            }
             replica.prepareForIndexRecovery();
             RecoveryTarget recoveryTarget = targetSupplier.apply(replica, pNode);
             StartRecoveryRequest request = new StartRecoveryRequest(replica.shardId(), pNode, rNode,
-                replica.store().getMetadataOrEmpty(), RecoveryState.Type.REPLICA, 0);
-            RecoverySourceHandler recovery = new RecoverySourceHandler(primary, recoveryTarget, request, (int) ByteSizeUnit.MB.toKB(1),
-                logger);
+                getMetadataSnapshotOrEmpty(replica), false, 0);
+            RecoverySourceHandler recovery = new RecoverySourceHandler(primary, recoveryTarget, request, () -> 0L, e -> () -> {},
+                (int) ByteSizeUnit.MB.toKB(1), logger);
             recovery.recoverToTarget();
             recoveryTarget.markAsDone();
             replica.updateRoutingEntry(ShardRoutingHelper.moveToStarted(replica.routingEntry()));
+        }
+
+        private Store.MetadataSnapshot getMetadataSnapshotOrEmpty(IndexShard replica) throws IOException {
+            Store.MetadataSnapshot result;
+            try {
+                result = replica.snapshotStoreMetadata();
+            } catch (IndexNotFoundException e) {
+                // OK!
+                result = Store.MetadataSnapshot.EMPTY;
+            } catch (IOException e) {
+                logger.warn("failed read store, treating as empty", e);
+                result = Store.MetadataSnapshot.EMPTY;
+            }
+            return result;
+        }
+
+        public synchronized DiscoveryNode getPrimaryNode() {
+            return getDiscoveryNode(primary.routingEntry().currentNodeId());
         }
 
         public Future<Void> asyncRecoverReplica(IndexShard replica, BiFunction<IndexShard, DiscoveryNode, RecoveryTarget> targetSupplier)
@@ -375,6 +419,10 @@ public abstract class ESIndexLevelReplicationTestCase extends ESTestCase {
         public Iterator<IndexShard> iterator() {
             return Iterators.<IndexShard>concat(replicas.iterator(), Collections.singleton(primary).iterator());
         }
+
+        public IndexShard getPrimary() {
+            return primary;
+        }
     }
 
     class IndexingOp extends ReplicationOperation<IndexRequest, IndexRequest, IndexingResult> {
@@ -382,7 +430,7 @@ public abstract class ESIndexLevelReplicationTestCase extends ESTestCase {
         private final ReplicationGroup replicationGroup;
 
         public IndexingOp(IndexRequest request, ActionListener<IndexingResult> listener, ReplicationGroup replicationGroup) {
-            super(request, new PrimaryRef(replicationGroup), listener, true, false, new ReplicasRef(replicationGroup),
+            super(request, new PrimaryRef(replicationGroup), listener, true, new ReplicasRef(replicationGroup),
                 () -> null, logger, "indexing");
             this.replicationGroup = replicationGroup;
             request.process(null, true, request.index());
@@ -393,6 +441,16 @@ public abstract class ESIndexLevelReplicationTestCase extends ESTestCase {
             return replicationGroup.shardRoutings();
         }
 
+        @Override
+        protected Set<String> getInSyncAllocationIds(ShardId shardId, ClusterState clusterState) {
+            return replicationGroup.shardRoutings().stream().filter(ShardRouting::active)
+                .map(shr -> shr.allocationId().getId()).collect(Collectors.toSet());
+        }
+
+        @Override
+        protected String checkActiveShardCount() {
+            return null;
+        }
     }
 
     private static class PrimaryRef implements ReplicationOperation.Primary<IndexRequest, IndexRequest, IndexingResult> {
@@ -442,8 +500,14 @@ public abstract class ESIndexLevelReplicationTestCase extends ESTestCase {
         }
 
         @Override
-        public void failShard(ShardRouting replica, ShardRouting primary, String message, Exception exception, Runnable onSuccess,
+        public void failShard(ShardRouting replica, long primaryTerm, String message, Exception exception, Runnable onSuccess,
                               Consumer<Exception> onPrimaryDemoted, Consumer<Exception> onIgnoredFailure) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void markShardCopyAsStale(ShardId shardId, String allocationId, long primaryTerm, Runnable onSuccess,
+                                         Consumer<Exception> onPrimaryDemoted, Consumer<Exception> onIgnoredFailure) {
             throw new UnsupportedOperationException();
         }
     }

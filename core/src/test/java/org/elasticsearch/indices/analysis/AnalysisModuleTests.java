@@ -25,6 +25,8 @@ import org.apache.lucene.analysis.Tokenizer;
 import org.apache.lucene.analysis.ar.ArabicNormalizationFilter;
 import org.apache.lucene.analysis.core.KeywordAnalyzer;
 import org.apache.lucene.analysis.core.WhitespaceTokenizer;
+import org.apache.lucene.analysis.de.GermanAnalyzer;
+import org.apache.lucene.analysis.en.EnglishAnalyzer;
 import org.apache.lucene.analysis.fa.PersianNormalizationFilter;
 import org.apache.lucene.analysis.hunspell.Dictionary;
 import org.apache.lucene.analysis.miscellaneous.KeywordRepeatFilter;
@@ -52,6 +54,7 @@ import org.elasticsearch.index.analysis.filter1.MyFilterTokenFilterFactory;
 import org.elasticsearch.indices.analysis.AnalysisModule.AnalysisProvider;
 import org.elasticsearch.plugins.AnalysisPlugin;
 import org.elasticsearch.test.IndexSettingsModule;
+import org.elasticsearch.test.VersionUtils;
 import org.hamcrest.MatcherAssert;
 
 import java.io.BufferedWriter;
@@ -126,27 +129,75 @@ public class AnalysisModuleTests extends ModuleTestCase {
         Settings settings = Settings.builder()
             .put("index.analysis.analyzer.foobar.alias","default")
             .put("index.analysis.analyzer.foobar.type", "keyword")
+            .put("index.analysis.analyzer.foobar_search.alias","default_search")
+            .put("index.analysis.analyzer.foobar_search.type","english")
             .put(Environment.PATH_HOME_SETTING.getKey(), createTempDir().toString())
-            .put(IndexMetaData.SETTING_VERSION_CREATED, Version.V_2_0_0)
+            // analyzer aliases are only allowed in 2.x indices
+            .put(IndexMetaData.SETTING_VERSION_CREATED, VersionUtils.randomVersionBetween(random(), Version.V_2_0_0, Version.V_2_3_5))
             .build();
         AnalysisRegistry newRegistry = getNewRegistry(settings);
         AnalysisService as = getAnalysisService(newRegistry, settings);
         assertThat(as.analyzer("default").analyzer(), is(instanceOf(KeywordAnalyzer.class)));
-
+        assertThat(as.analyzer("default_search").analyzer(), is(instanceOf(EnglishAnalyzer.class)));
     }
 
-    public void testDoubleAlias() throws IOException {
+    public void testAnalyzerAliasReferencesAlias() throws IOException {
+        Settings settings = Settings.builder()
+            .put("index.analysis.analyzer.foobar.alias","default")
+            .put("index.analysis.analyzer.foobar.type", "german")
+            .put("index.analysis.analyzer.foobar_search.alias","default_search")
+            .put("index.analysis.analyzer.foobar_search.type", "default")
+            .put(Environment.PATH_HOME_SETTING.getKey(), createTempDir().toString())
+            // analyzer aliases are only allowed in 2.x indices
+            .put(IndexMetaData.SETTING_VERSION_CREATED, VersionUtils.randomVersionBetween(random(), Version.V_2_0_0, Version.V_2_3_5))
+            .build();
+        AnalysisRegistry newRegistry = getNewRegistry(settings);
+        AnalysisService as = getAnalysisService(newRegistry, settings);
+        assertThat(as.analyzer("default").analyzer(), is(instanceOf(GermanAnalyzer.class)));
+        // analyzer types are bound early before we resolve aliases
+        assertThat(as.analyzer("default_search").analyzer(), is(instanceOf(StandardAnalyzer.class)));
+    }
+
+    public void testAnalyzerAliasDefault() throws IOException {
         Settings settings = Settings.builder()
             .put("index.analysis.analyzer.foobar.alias","default")
             .put("index.analysis.analyzer.foobar.type", "keyword")
-            .put("index.analysis.analyzer.barfoo.alias","default")
-            .put("index.analysis.analyzer.barfoo.type","english")
             .put(Environment.PATH_HOME_SETTING.getKey(), createTempDir().toString())
-            .put(IndexMetaData.SETTING_VERSION_CREATED, Version.V_2_0_0)
+            // analyzer aliases are only allowed in 2.x indices
+            .put(IndexMetaData.SETTING_VERSION_CREATED, VersionUtils.randomVersionBetween(random(), Version.V_2_0_0, Version.V_2_3_5))
             .build();
         AnalysisRegistry newRegistry = getNewRegistry(settings);
-        String message = expectThrows(IllegalStateException.class, () -> getAnalysisService(newRegistry, settings)).getMessage();
-        assertEquals("already registered analyzer with name: default", message);
+        AnalysisService as = getAnalysisService(newRegistry, settings);
+        assertThat(as.analyzer("default").analyzer(), is(instanceOf(KeywordAnalyzer.class)));
+        assertThat(as.analyzer("default_search").analyzer(), is(instanceOf(KeywordAnalyzer.class)));
+    }
+
+    public void testAnalyzerAliasMoreThanOnce() throws IOException {
+        Settings settings = Settings.builder()
+            .put("index.analysis.analyzer.foobar.alias","default")
+            .put("index.analysis.analyzer.foobar.type", "keyword")
+            .put("index.analysis.analyzer.foobar1.alias","default")
+            .put("index.analysis.analyzer.foobar1.type", "english")
+            // analyzer aliases are only allowed in 2.x indices
+            .put(IndexMetaData.SETTING_VERSION_CREATED, VersionUtils.randomVersionBetween(random(), Version.V_2_0_0, Version.V_2_3_5))
+            .put(Environment.PATH_HOME_SETTING.getKey(), createTempDir().toString())
+            .build();
+        AnalysisRegistry newRegistry = getNewRegistry(settings);
+        IllegalStateException ise = expectThrows(IllegalStateException.class, () -> getAnalysisService(newRegistry, settings));
+        assertEquals("alias [default] is already used by [foobar]", ise.getMessage());
+    }
+
+    public void testAnalyzerAliasNotAllowedPost5x() throws IOException {
+        Settings settings = Settings.builder()
+            .put("index.analysis.analyzer.foobar.type", "standard")
+            .put("index.analysis.analyzer.foobar.alias","foobaz")
+            // analyzer aliases were removed in v5.0.0 alpha6
+            .put(IndexMetaData.SETTING_VERSION_CREATED, VersionUtils.randomVersionBetween(random(), Version.V_5_0_0_alpha6, null))
+            .put(Environment.PATH_HOME_SETTING.getKey(), createTempDir().toString())
+            .build();
+        AnalysisRegistry registry = getNewRegistry(settings);
+        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> getAnalysisService(registry, settings));
+        assertEquals("setting [index.analysis.analyzer.foobar.alias] is not supported", e.getMessage());
     }
 
     public void testVersionedAnalyzers() throws Exception {
@@ -212,10 +263,6 @@ public class AnalysisModuleTests extends ModuleTestCase {
         assertThat(analyzer, instanceOf(CustomAnalyzer.class));
         CustomAnalyzer custom5 = (CustomAnalyzer) analyzer;
         assertThat(custom5.charFilters()[0], instanceOf(MappingCharFilterFactory.class));
-
-        // verify aliases
-        analyzer = analysisService.analyzer("alias1").analyzer();
-        assertThat(analyzer, instanceOf(StandardAnalyzer.class));
 
         // check custom pattern replace filter
         analyzer = analysisService.analyzer("custom3").analyzer();
@@ -299,7 +346,8 @@ public class AnalysisModuleTests extends ModuleTestCase {
                 .put("index.analysis.analyzer.valid_name.tokenizer", "keyword")
                 .put("index.analysis.analyzer.valid_name.alias", "_invalid_name")
                 .put(Environment.PATH_HOME_SETTING.getKey(), createTempDir().toString())
-                .put(IndexMetaData.SETTING_VERSION_CREATED, "1")
+                // analyzer aliases are only allowed for 2.x indices
+                .put(IndexMetaData.SETTING_VERSION_CREATED, VersionUtils.randomVersionBetween(random(), Version.V_2_0_0, Version.V_2_3_5))
                 .build();
         try {
             getAnalysisService(settings);

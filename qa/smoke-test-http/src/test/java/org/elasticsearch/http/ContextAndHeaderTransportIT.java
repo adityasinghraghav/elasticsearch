@@ -46,12 +46,12 @@ import org.elasticsearch.index.query.TermsQueryBuilder;
 import org.elasticsearch.indices.TermsLookup;
 import org.elasticsearch.plugins.ActionPlugin;
 import org.elasticsearch.plugins.Plugin;
-import org.elasticsearch.rest.RestController;
 import org.elasticsearch.test.ESIntegTestCase.ClusterScope;
 import org.elasticsearch.threadpool.ThreadPool;
 import org.junit.After;
 import org.junit.Before;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -75,7 +75,7 @@ import static org.hamcrest.Matchers.is;
 @ClusterScope(scope = SUITE)
 public class ContextAndHeaderTransportIT extends HttpSmokeTestCase {
     private static final List<RequestAndHeaders> requests =  new CopyOnWriteArrayList<>();
-    private String randomHeaderKey = randomAsciiOfLength(10);
+    private static final String CUSTOM_HEADER = "SomeCustomHeader";
     private String randomHeaderValue = randomAsciiOfLength(20);
     private String queryIndex = "query-" + randomAsciiOfLength(10).toLowerCase(Locale.ROOT);
     private String lookupIndex = "lookup-" + randomAsciiOfLength(10).toLowerCase(Locale.ROOT);
@@ -97,6 +97,7 @@ public class ContextAndHeaderTransportIT extends HttpSmokeTestCase {
     protected Collection<Class<? extends Plugin>> nodePlugins() {
         ArrayList<Class<? extends Plugin>> plugins = new ArrayList<>(super.nodePlugins());
         plugins.add(ActionLoggingPlugin.class);
+        plugins.add(CustomHeadersPlugin.class);
         return plugins;
     }
 
@@ -218,23 +219,17 @@ public class ContextAndHeaderTransportIT extends HttpSmokeTestCase {
         assertRequestsContainHeader(MultiTermVectorsRequest.class);
     }
 
-    public void testThatRelevantHttpHeadersBecomeRequestHeaders() throws Exception {
-        String relevantHeaderName = "relevant_" + randomHeaderKey;
-        for (RestController restController : internalCluster().getInstances(RestController.class)) {
-            restController.registerRelevantHeaders(relevantHeaderName);
-        }
-
-        try (Response response = getRestClient().performRequest(
-                "GET", "/" + queryIndex + "/_search",
-                new BasicHeader(randomHeaderKey, randomHeaderValue), new BasicHeader(relevantHeaderName, randomHeaderValue))) {
-            assertThat(response.getStatusLine().getStatusCode(), equalTo(200));
-            List<RequestAndHeaders> searchRequests = getRequests(SearchRequest.class);
-            assertThat(searchRequests, hasSize(greaterThan(0)));
-            for (RequestAndHeaders requestAndHeaders : searchRequests) {
-                assertThat(requestAndHeaders.headers.containsKey(relevantHeaderName), is(true));
-                // was not specified, thus is not included
-                assertThat(requestAndHeaders.headers.containsKey(randomHeaderKey), is(false));
-            }
+    public void testThatRelevantHttpHeadersBecomeRequestHeaders() throws IOException {
+        final String IRRELEVANT_HEADER = "SomeIrrelevantHeader";
+        Response response = getRestClient().performRequest("GET", "/" + queryIndex + "/_search",
+                new BasicHeader(CUSTOM_HEADER, randomHeaderValue), new BasicHeader(IRRELEVANT_HEADER, randomHeaderValue));
+        assertThat(response.getStatusLine().getStatusCode(), equalTo(200));
+        List<RequestAndHeaders> searchRequests = getRequests(SearchRequest.class);
+        assertThat(searchRequests, hasSize(greaterThan(0)));
+        for (RequestAndHeaders requestAndHeaders : searchRequests) {
+            assertThat(requestAndHeaders.headers.containsKey(CUSTOM_HEADER), is(true));
+            // was not specified, thus is not included
+            assertThat(requestAndHeaders.headers.containsKey(IRRELEVANT_HEADER), is(false));
         }
     }
 
@@ -273,21 +268,21 @@ public class ContextAndHeaderTransportIT extends HttpSmokeTestCase {
     }
 
     private void assertRequestContainsHeader(ActionRequest request, Map<String, String> context) {
-        String msg = String.format(Locale.ROOT, "Expected header %s to be in request %s", randomHeaderKey, request.getClass().getName());
+        String msg = String.format(Locale.ROOT, "Expected header %s to be in request %s", CUSTOM_HEADER, request.getClass().getName());
         if (request instanceof IndexRequest) {
             IndexRequest indexRequest = (IndexRequest) request;
-            msg = String.format(Locale.ROOT, "Expected header %s to be in index request %s/%s/%s", randomHeaderKey,
+            msg = String.format(Locale.ROOT, "Expected header %s to be in index request %s/%s/%s", CUSTOM_HEADER,
                 indexRequest.index(), indexRequest.type(), indexRequest.id());
         }
-        assertThat(msg, context.containsKey(randomHeaderKey), is(true));
-        assertThat(context.get(randomHeaderKey).toString(), is(randomHeaderValue));
+        assertThat(msg, context.containsKey(CUSTOM_HEADER), is(true));
+        assertThat(context.get(CUSTOM_HEADER).toString(), is(randomHeaderValue));
     }
 
     /**
      * a transport client that adds our random header
      */
     private Client transportClient() {
-        return internalCluster().transportClient().filterWithHeader(Collections.singletonMap(randomHeaderKey, randomHeaderValue));
+        return internalCluster().transportClient().filterWithHeader(Collections.singletonMap(CUSTOM_HEADER, randomHeaderValue));
     }
 
     public static class ActionLoggingPlugin extends Plugin implements ActionPlugin {
@@ -345,6 +340,12 @@ public class ContextAndHeaderTransportIT extends HttpSmokeTestCase {
         private RequestAndHeaders(Map<String, String> headers, ActionRequest request) {
             this.headers = headers;
             this.request = request;
+        }
+    }
+
+    public static class CustomHeadersPlugin extends Plugin implements ActionPlugin {
+        public Collection<String> getRestHeaders() {
+            return Collections.singleton(CUSTOM_HEADER);
         }
     }
 }

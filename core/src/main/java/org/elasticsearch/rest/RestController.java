@@ -19,6 +19,8 @@
 
 package org.elasticsearch.rest;
 
+import org.apache.logging.log4j.message.ParameterizedMessage;
+import org.apache.logging.log4j.util.Supplier;
 import org.elasticsearch.client.node.NodeClient;
 import org.elasticsearch.common.Nullable;
 import org.elasticsearch.common.bytes.BytesArray;
@@ -28,17 +30,12 @@ import org.elasticsearch.common.path.PathTrie;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.util.concurrent.ThreadContext;
 import org.elasticsearch.common.xcontent.XContentBuilder;
-import org.elasticsearch.rest.support.RestUtils;
 
 import java.io.IOException;
 import java.util.Arrays;
-import java.util.Collections;
-import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import static java.util.Collections.emptySet;
-import static java.util.Collections.unmodifiableSet;
 import static org.elasticsearch.rest.RestStatus.BAD_REQUEST;
 import static org.elasticsearch.rest.RestStatus.OK;
 
@@ -55,13 +52,15 @@ public class RestController extends AbstractLifecycleComponent {
 
     private final RestHandlerFilter handlerFilter = new RestHandlerFilter();
 
-    private Set<String> relevantHeaders = emptySet();
+    /** Rest headers that are copied to internal requests made during a rest request. */
+    private final Set<String> headersToCopy;
 
     // non volatile since the assumption is that pre processors are registered on startup
     private RestFilter[] filters = new RestFilter[0];
 
-    public RestController(Settings settings) {
+    public RestController(Settings settings, Set<String> headersToCopy) {
         super(settings);
+        this.headersToCopy = headersToCopy;
     }
 
     @Override
@@ -77,28 +76,6 @@ public class RestController extends AbstractLifecycleComponent {
         for (RestFilter filter : filters) {
             filter.close();
         }
-    }
-
-    /**
-     * Controls which REST headers get copied over from a {@link org.elasticsearch.rest.RestRequest} to
-     * its corresponding {@link org.elasticsearch.transport.TransportRequest}(s).
-     *
-     * By default no headers get copied but it is possible to extend this behaviour via plugins by calling this method.
-     */
-    public synchronized void registerRelevantHeaders(String... headers) {
-        Set<String> newRelevantHeaders = new HashSet<>(relevantHeaders.size() + headers.length);
-        newRelevantHeaders.addAll(relevantHeaders);
-        Collections.addAll(newRelevantHeaders, headers);
-        relevantHeaders = unmodifiableSet(newRelevantHeaders);
-    }
-
-    /**
-     * Returns the REST headers that get copied over from a {@link org.elasticsearch.rest.RestRequest} to
-     * its corresponding {@link org.elasticsearch.transport.TransportRequest}(s).
-     * By default no headers get copied but it is possible to extend this behaviour via plugins by calling {@link #registerRelevantHeaders(String...)}.
-     */
-    public Set<String> relevantHeaders() {
-        return relevantHeaders;
     }
 
     /**
@@ -212,8 +189,8 @@ public class RestController extends AbstractLifecycleComponent {
         if (!checkRequestParameters(request, channel)) {
             return;
         }
-        try (ThreadContext.StoredContext t = threadContext.stashContext()) {
-            for (String key : relevantHeaders) {
+        try (ThreadContext.StoredContext ignored = threadContext.stashContext()) {
+            for (String key : headersToCopy) {
                 String httpHeader = request.header(key);
                 if (httpHeader != null) {
                     threadContext.putHeader(key, httpHeader);
@@ -233,7 +210,7 @@ public class RestController extends AbstractLifecycleComponent {
             channel.sendResponse(new BytesRestResponse(channel, e));
         } catch (Exception inner) {
             inner.addSuppressed(e);
-            logger.error("failed to send failure response for uri [{}]", inner, request.uri());
+            logger.error((Supplier<?>) () -> new ParameterizedMessage("failed to send failure response for uri [{}]", request.uri()), inner);
         }
     }
 
@@ -335,7 +312,7 @@ public class RestController extends AbstractLifecycleComponent {
                 try {
                     channel.sendResponse(new BytesRestResponse(channel, e));
                 } catch (IOException e1) {
-                    logger.error("Failed to send failure response for uri [{}]", e1, request.uri());
+                    logger.error((Supplier<?>) () -> new ParameterizedMessage("Failed to send failure response for uri [{}]", request.uri()), e1);
                 }
             }
         }

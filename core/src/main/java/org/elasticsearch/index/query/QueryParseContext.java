@@ -25,8 +25,11 @@ import org.elasticsearch.common.ParseFieldMatcherSupplier;
 import org.elasticsearch.common.ParsingException;
 import org.elasticsearch.common.logging.DeprecationLogger;
 import org.elasticsearch.common.logging.Loggers;
+import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.xcontent.XContentParser;
 import org.elasticsearch.indices.query.IndicesQueriesRegistry;
+import org.elasticsearch.script.Script;
+import org.elasticsearch.script.ScriptSettings;
 
 import java.io.IOException;
 import java.util.Objects;
@@ -42,11 +45,18 @@ public class QueryParseContext implements ParseFieldMatcherSupplier {
     private final XContentParser parser;
     private final IndicesQueriesRegistry indicesQueriesRegistry;
     private final ParseFieldMatcher parseFieldMatcher;
+    private final String defaultScriptLanguage;
 
     public QueryParseContext(IndicesQueriesRegistry registry, XContentParser parser, ParseFieldMatcher parseFieldMatcher) {
+        this(Script.DEFAULT_SCRIPT_LANG, registry, parser, parseFieldMatcher);
+    }
+
+    public QueryParseContext(String defaultScriptLanguage, IndicesQueriesRegistry registry, XContentParser parser,
+                             ParseFieldMatcher parseFieldMatcher) {
         this.indicesQueriesRegistry = Objects.requireNonNull(registry, "indices queries registry cannot be null");
         this.parser = Objects.requireNonNull(parser, "parser cannot be null");
         this.parseFieldMatcher = Objects.requireNonNull(parseFieldMatcher, "parse field matcher cannot be null");
+        this.defaultScriptLanguage = defaultScriptLanguage;
     }
 
     public XContentParser parser() {
@@ -72,9 +82,6 @@ public class QueryParseContext implements ParseFieldMatcherSupplier {
                         throw new ParsingException(parser.getTokenLocation(), "request does not support [" + parser.currentName() + "]");
                     }
                 }
-            }
-            if (queryBuilder == null) {
-                throw new ParsingException(parser.getTokenLocation(), "Required query is missing");
             }
             return queryBuilder;
         } catch (ParsingException e) {
@@ -112,21 +119,30 @@ public class QueryParseContext implements ParseFieldMatcherSupplier {
         String queryName = parser.currentName();
         // move to the next START_OBJECT
         token = parser.nextToken();
-        if (token != XContentParser.Token.START_OBJECT && token != XContentParser.Token.START_ARRAY) {
-            throw new ParsingException(parser.getTokenLocation(), "[_na] query malformed, no field after start_object");
+        if (token != XContentParser.Token.START_OBJECT) {
+            throw new ParsingException(parser.getTokenLocation(), "[" + queryName + "] query malformed, no start_object after query name");
         }
         @SuppressWarnings("unchecked")
         Optional<QueryBuilder> result = (Optional<QueryBuilder>) indicesQueriesRegistry.lookup(queryName, parseFieldMatcher,
                 parser.getTokenLocation()).fromXContent(this);
-        if (parser.currentToken() == XContentParser.Token.END_OBJECT || parser.currentToken() == XContentParser.Token.END_ARRAY) {
-            // if we are at END_OBJECT, move to the next one...
-            parser.nextToken();
+        if (parser.currentToken() != XContentParser.Token.END_OBJECT) {
+            throw new ParsingException(parser.getTokenLocation(),
+                    "[" + queryName + "] malformed query, expected [END_OBJECT] but found [" + parser.currentToken() + "]");
         }
+        parser.nextToken();
         return result;
     }
 
     @Override
     public ParseFieldMatcher getParseFieldMatcher() {
         return parseFieldMatcher;
+    }
+
+    /**
+     * Returns the default scripting language, that should be used if scripts don't specify the script language
+     * explicitly.
+     */
+    public String getDefaultScriptLanguage() {
+        return defaultScriptLanguage;
     }
 }

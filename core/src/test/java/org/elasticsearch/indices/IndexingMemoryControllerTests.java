@@ -21,6 +21,7 @@ package org.elasticsearch.indices;
 import org.elasticsearch.Version;
 import org.elasticsearch.action.admin.indices.forcemerge.ForceMergeResponse;
 import org.elasticsearch.cluster.node.DiscoveryNode;
+import org.elasticsearch.cluster.routing.RecoverySource;
 import org.elasticsearch.cluster.routing.ShardRouting;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.transport.LocalTransportAddress;
@@ -34,6 +35,7 @@ import org.elasticsearch.index.shard.IndexShardTests;
 import org.elasticsearch.indices.recovery.RecoveryState;
 import org.elasticsearch.test.ESSingleNodeTestCase;
 import org.elasticsearch.threadpool.ThreadPool;
+import org.elasticsearch.threadpool.ThreadPool.Cancellable;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -43,7 +45,6 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -160,7 +161,7 @@ public class IndexingMemoryControllerTests extends ESSingleNodeTestCase {
         }
 
         @Override
-        protected ScheduledFuture<?> scheduleTask(ThreadPool threadPool) {
+        protected Cancellable scheduleTask(ThreadPool threadPool) {
             return null;
         }
     }
@@ -390,7 +391,7 @@ public class IndexingMemoryControllerTests extends ESSingleNodeTestCase {
             }
 
             @Override
-            protected ScheduledFuture<?> scheduleTask(ThreadPool threadPool) {
+            protected Cancellable scheduleTask(ThreadPool threadPool) {
                 return null;
             }
         };
@@ -448,7 +449,7 @@ public class IndexingMemoryControllerTests extends ESSingleNodeTestCase {
             assertEquals(0, imc.availableShards().size());
             ShardRouting routing = newShard.routingEntry();
             DiscoveryNode localNode = new DiscoveryNode("foo", LocalTransportAddress.buildUnique(), emptyMap(), emptySet(), Version.CURRENT);
-            newShard.markAsRecovering("store", new RecoveryState(newShard.shardId(), routing.primary(), RecoveryState.Type.STORE, localNode, localNode));
+            newShard.markAsRecovering("store", new RecoveryState(routing, localNode, null));
 
             assertEquals(1, imc.availableShards().size());
             assertTrue(newShard.recoverFromStore());

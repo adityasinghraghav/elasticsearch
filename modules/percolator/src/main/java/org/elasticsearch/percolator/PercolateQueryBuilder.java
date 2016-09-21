@@ -64,8 +64,8 @@ import org.elasticsearch.index.mapper.DocumentMapperForType;
 import org.elasticsearch.index.mapper.MappedFieldType;
 import org.elasticsearch.index.mapper.MapperService;
 import org.elasticsearch.index.mapper.ParsedDocument;
-import org.elasticsearch.index.mapper.internal.SourceFieldMapper;
-import org.elasticsearch.index.mapper.internal.TypeFieldMapper;
+import org.elasticsearch.index.mapper.SourceFieldMapper;
+import org.elasticsearch.index.mapper.TypeFieldMapper;
 import org.elasticsearch.index.query.AbstractQueryBuilder;
 import org.elasticsearch.index.query.QueryBuilder;
 import org.elasticsearch.index.query.QueryParseContext;
@@ -81,9 +81,7 @@ import static org.elasticsearch.index.mapper.SourceToParse.source;
 import static org.elasticsearch.percolator.PercolatorFieldMapper.parseQuery;
 
 public class PercolateQueryBuilder extends AbstractQueryBuilder<PercolateQueryBuilder> {
-
     public static final String NAME = "percolate";
-    public static final ParseField QUERY_NAME_FIELD = new ParseField(NAME);
 
     static final ParseField DOCUMENT_FIELD = new ParseField("document");
     private static final ParseField QUERY_FIELD = new ParseField("field");
@@ -517,7 +515,8 @@ public class PercolateQueryBuilder extends AbstractQueryBuilder<PercolateQueryBu
                             currentFieldName = sourceParser.currentName();
                         } else if (token == XContentParser.Token.START_OBJECT) {
                             if ("query".equals(currentFieldName)) {
-                                return parseQuery(context, mapUnmappedFieldsAsString, sourceParser);
+                                QueryParseContext queryParseContext = context.newParseContextWithLegacyScriptLanguage(sourceParser);
+                                return parseQuery(context, mapUnmappedFieldsAsString, queryParseContext, sourceParser);
                             } else {
                                 sourceParser.skipChildren();
                             }
